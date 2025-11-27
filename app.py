@@ -3,18 +3,15 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import seaborn as sns
-import matplotlib.pyplot as plt
-from io import BytesIO
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import precision_score, recall_score, f1_score
 import time
 
-# Import custom modules
+# Import the data generator from your provided file
 from generate_data import generate_banking_data
-from preprocess import DataPreprocessor
-from model import AnomalyDetector, create_ground_truth_labels
 
-# Page configuration
+# --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="🛡️ Ransomware Detection System",
     page_icon="🛡️",
@@ -22,381 +19,300 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# --- CUSTOM CSS ---
 st.markdown("""
     <style>
     .main-header {
         font-size: 2.5rem;
-        color: #1f77b4;
+        color: #E63946;
+        text-align: center;
+        font-weight: 800;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #457B9D;
         text-align: center;
         margin-bottom: 2rem;
     }
     .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #1f77b4;
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        padding: 15px;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
     }
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'data_generated' not in st.session_state:
-    st.session_state.data_generated = False
-if 'data_preprocessed' not in st.session_state:
-    st.session_state.data_preprocessed = False
-if 'model_trained' not in st.session_state:
-    st.session_state.model_trained = False
+# --- SESSION STATE INITIALIZATION ---
+if 'data' not in st.session_state:
+    st.session_state.data = None
+if 'clean_data' not in st.session_state:
+    st.session_state.clean_data = None
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'predictions' not in st.session_state:
+    st.session_state.predictions = None
+if 'scaler' not in st.session_state:
+    st.session_state.scaler = None
 
-# Title
-st.markdown("<h1 class='main-header'>🛡️ Proactive Ransomware Detection System</h1>", unsafe_allow_html=True)
-st.markdown("**Unsupervised Machine Learning for Banking Security**")
-st.markdown("---")
+# --- HELPER FUNCTIONS (Logic moved from quick_run.py) ---
+
+def preprocess_data(df_raw):
+    """
+    Cleans the raw dataframe based on logic from quick_run.py
+    """
+    df = df_raw.copy()
+    
+    # 1. Handle missing values
+    for col in df.select_dtypes(include=[np.number]).columns:
+        if df[col].isnull().sum() > 0:
+            df[col] = df[col].fillna(df[col].median())
+            
+    # 2. Fix invalid ranges
+    if 'cpu_usage' in df.columns:
+        df['cpu_usage'] = df['cpu_usage'].clip(0, 100)
+    if 'data_outbound_mb' in df.columns:
+        df['data_outbound_mb'] = df['data_outbound_mb'].clip(lower=0)
+    if 'hour_of_day' in df.columns:
+        df['hour_of_day'] = df['hour_of_day'].clip(0, 23)
+    if 'failed_logins' in df.columns:
+        df['failed_logins'] = df['failed_logins'].clip(lower=0)
+
+    # 3. Remove duplicates
+    df = df.drop_duplicates()
+    
+    # 4. Encode user_id
+    if 'user_id' in df.columns:
+        le = LabelEncoder()
+        df['user_id_encoded'] = le.fit_transform(df['user_id'])
+        
+    return df
+
+def train_and_predict(df, contamination=0.03):
+    """
+    Trains Isolation Forest and generates predictions
+    """
+    # Select features
+    exclude_cols = ['user_id', 'timestamp', 'user_id_encoded', 'is_anomaly', 'anomaly_type'] 
+    feature_cols = [col for col in df.columns if col not in exclude_cols 
+                    and df[col].dtype in [np.float64, np.int64]]
+    
+    X = df[feature_cols].values
+    
+    # Scale
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Train Isolation Forest
+    model = IsolationForest(
+        contamination=contamination,
+        random_state=42,
+        n_estimators=100,
+        n_jobs=-1
+    )
+    model.fit(X_scaled)
+    
+    # Predict
+    # -1 is anomaly, 1 is normal in sklearn
+    # We convert to: 1 = anomaly, 0 = normal
+    raw_predictions = model.predict(X_scaled)
+    anomaly_scores = -model.score_samples(X_scaled)
+    is_anomaly = (raw_predictions == -1).astype(int)
+    
+    return model, scaler, is_anomaly, anomaly_scores, feature_cols
+
+def generate_ground_truth(df):
+    """
+    Recreates the ground truth logic from quick_run.py for evaluation
+    """
+    true_labels = np.zeros(len(df))
+    conditions = (
+        (df['file_encryption_rate'] > 10) |
+        ((df['failed_logins'] > 8) & (df['session_duration'] < 500)) |
+        ((df['data_outbound_mb'] > 400) & (df['hour_of_day'].isin([0,1,2,3,22,23]))) |
+        ((df['files_accessed'] > 500) & (df['cpu_usage'] > 70))
+    )
+    true_labels[conditions] = 1
+    return true_labels
+
+# --- UI LAYOUT ---
+
+st.markdown("<h1 class='main-header'>🛡️ Proactive Ransomware Detection</h1>", unsafe_allow_html=True)
+st.markdown("<div class='sub-header'>Unsupervised Anomaly Detection for Banking Logs</div>", unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/000000/security-checked.png", width=100)
-    st.title("⚙️ Configuration")
+    st.header("⚙️ Configuration")
+    st.subheader("Data Generation")
+    n_records = st.slider("Number of Records", 1000, 20000, 5000, step=1000)
     
-    st.subheader("📁 Data Source")
-    data_source = st.radio(
-        "Choose data source:",
-        ["Generate New Dataset", "Upload CSV File"]
-    )
+    st.subheader("Model Settings")
+    contamination = st.slider("Expected Contamination (%)", 1, 10, 3) / 100.0
     
-    if data_source == "Generate New Dataset":
-        n_records = st.slider("Number of records", 1000, 20000, 10000, 1000)
-        if st.button("🚀 Generate Data", type="primary"):
-            with st.spinner("Generating synthetic banking logs..."):
-                df_raw = generate_banking_data(n_records)
-                st.session_state.df_raw = df_raw
-                st.session_state.data_generated = True
-                st.success(f"✅ Generated {len(df_raw)} records!")
-    else:
-        uploaded_file = st.file_uploader("Upload CSV file", type=['csv'])
-        if uploaded_file is not None:
-            df_raw = pd.read_csv(uploaded_file)
-            st.session_state.df_raw = df_raw
-            st.session_state.data_generated = True
-            st.success(f"✅ Loaded {len(df_raw)} records!")
-    
-    st.markdown("---")
-    
-    st.subheader("🤖 Model Settings")
-    model_type = st.selectbox(
-        "Choose model:",
-        ["Isolation Forest", "Autoencoder"]
-    )
-    
-    contamination = st.slider(
-        "Expected anomaly rate (%)",
-        1.0, 10.0, 3.0, 0.5
-    ) / 100
-    
-    threshold = st.slider(
-        "Anomaly score threshold",
-        0.0, 1.0, 0.5, 0.05
-    )
+    if st.button("🔄 Generate & Train", type="primary"):
+        with st.spinner("Generating synthetic data..."):
+            raw_data = generate_banking_data(n_records)
+            st.session_state.data = raw_data
+        
+        with st.spinner("Preprocessing & Cleaning..."):
+            clean_df = preprocess_data(raw_data)
+            st.session_state.clean_data = clean_df
+            
+        with st.spinner("Training Isolation Forest..."):
+            model, scaler, preds, scores, features = train_and_predict(clean_df, contamination)
+            st.session_state.model = model
+            st.session_state.scaler = scaler
+            
+            # Combine results
+            clean_df['is_anomaly_pred'] = preds
+            clean_df['anomaly_score'] = scores
+            clean_df['true_label'] = generate_ground_truth(clean_df)
+            st.session_state.predictions = clean_df
+            st.session_state.features = features
+            
+        st.success("Pipeline Completed Successfully!")
 
-# Main content
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Data Overview", 
-    "🔧 Preprocessing", 
-    "🎯 Model Training", 
-    "📈 Results & Analysis",
-    "🔴 Real-time Simulation"
-])
+# Main Content Tabs
+tab1, tab2, tab3 = st.tabs(["📊 Data & Performance", "🔍 Anomaly Investigation", "🔴 Live Simulation"])
 
-# Tab 1: Data Overview
+# --- TAB 1: DATA & PERFORMANCE ---
 with tab1:
-    st.header("📊 Dataset Overview")
-    
-    if st.session_state.data_generated:
-        df_raw = st.session_state.df_raw
+    if st.session_state.predictions is None:
+        st.info("👈 Click 'Generate & Train' in the sidebar to start the system.")
+    else:
+        df = st.session_state.predictions
         
+        # Metrics Row
         col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Records", f"{len(df_raw):,}")
-        with col2:
-            st.metric("Features", len(df_raw.columns))
-        with col3:
-            st.metric("Missing Values", df_raw.isnull().sum().sum())
-        with col4:
-            st.metric("Unique Users", df_raw['user_id'].nunique())
         
-        st.subheader("Raw Data Preview")
-        st.dataframe(df_raw.head(20), use_container_width=True)
+        n_anomalies = df['is_anomaly_pred'].sum()
+        precision = precision_score(df['true_label'], df['is_anomaly_pred'])
+        recall = recall_score(df['true_label'], df['is_anomaly_pred'])
+        f1 = f1_score(df['true_label'], df['is_anomaly_pred'])
         
-        st.subheader("Data Quality Issues")
-        col1, col2 = st.columns(2)
+        col1.metric("Total Records", len(df))
+        col2.metric("Anomalies Detected", f"{n_anomalies} ({n_anomalies/len(df):.1%})")
+        col3.metric("Precision", f"{precision:.2%}")
+        col4.metric("Recall (Sensitivity)", f"{recall:.2%}")
         
-        with col1:
-            st.write("**Missing Values by Column**")
-            missing = df_raw.isnull().sum()
-            missing = missing[missing > 0]
-            if len(missing) > 0:
-                fig = px.bar(x=missing.index, y=missing.values, 
-                           labels={'x': 'Column', 'y': 'Missing Count'})
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No missing values found")
+        st.divider()
         
-        with col2:
-            st.write("**Data Statistics**")
-            st.dataframe(df_raw.describe(), use_container_width=True)
+        col_chart1, col_chart2 = st.columns(2)
         
-    else:
-        st.info("👈 Please generate or upload data from the sidebar")
+        with col_chart1:
+            st.subheader("Anomaly Score Distribution")
+            fig_hist = px.histogram(df, x="anomaly_score", color="is_anomaly_pred", 
+                                    nbins=50, title="Distribution of Isolation Forest Scores",
+                                    color_discrete_map={0: "blue", 1: "red"},
+                                    labels={"is_anomaly_pred": "Detected Anomaly"})
+            st.plotly_chart(fig_hist, use_container_width=True)
+            
+        with col_chart2:
+            st.subheader("Confusion Matrix")
+            # Simple confusion matrix viz
+            cm_data = pd.crosstab(df['true_label'], df['is_anomaly_pred'], 
+                                  rownames=['Actual'], colnames=['Predicted'])
+            fig_cm = px.imshow(cm_data, text_auto=True, color_continuous_scale='Blues',
+                               title="Confusion Matrix (Actual vs Predicted)")
+            st.plotly_chart(fig_cm, use_container_width=True)
 
-# Tab 2: Preprocessing
+# --- TAB 2: ANOMALY INVESTIGATION ---
 with tab2:
-    st.header("🔧 Data Preprocessing")
-    
-    if st.session_state.data_generated:
-        if st.button("▶️ Run Preprocessing Pipeline", type="primary"):
-            with st.spinner("Preprocessing data..."):
-                preprocessor = DataPreprocessor()
-                df_scaled, df_clean = preprocessor.preprocess(st.session_state.df_raw)
-                
-                st.session_state.df_scaled = df_scaled
-                st.session_state.df_clean = df_clean
-                st.session_state.preprocessor = preprocessor
-                st.session_state.data_preprocessed = True
-                
-                st.success("✅ Preprocessing complete!")
-        
-        if st.session_state.data_preprocessed:
-            st.subheader("📋 Preprocessing Log")
-            log_text = st.session_state.preprocessor.get_preprocessing_summary()
-            st.text_area("Processing steps:", log_text, height=300)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Before Preprocessing")
-                st.metric("Records", len(st.session_state.df_raw))
-                st.metric("Missing Values", st.session_state.df_raw.isnull().sum().sum())
-            
-            with col2:
-                st.subheader("After Preprocessing")
-                st.metric("Records", len(st.session_state.df_clean))
-                st.metric("Missing Values", st.session_state.df_clean.isnull().sum().sum())
-            
-            st.subheader("Cleaned Data Preview")
-            st.dataframe(st.session_state.df_clean.head(20), use_container_width=True)
-            
-            # Download button
-            csv = st.session_state.df_clean.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Cleaned Data",
-                data=csv,
-                file_name="banking_logs_clean.csv",
-                mime="text/csv"
-            )
+    if st.session_state.predictions is None:
+        st.info("Please train the model first.")
     else:
-        st.info("👈 Please generate or upload data first")
-
-# Tab 3: Model Training
-with tab3:
-    st.header("🎯 Anomaly Detection Model")
-    
-    if st.session_state.data_preprocessed:
-        if st.button("🚀 Train Model", type="primary"):
-            with st.spinner(f"Training {model_type} model..."):
-                # Initialize detector
-                model_type_key = 'isolation_forest' if model_type == 'Isolation Forest' else 'autoencoder'
-                detector = AnomalyDetector(model_type=model_type_key, contamination=contamination)
-                
-                # Train
-                progress_bar = st.progress(0)
-                for i in range(100):
-                    time.sleep(0.01)
-                    progress_bar.progress(i + 1)
-                
-                detector.train(st.session_state.df_scaled)
-                
-                # Create ground truth for evaluation
-                true_labels = create_ground_truth_labels(st.session_state.df_clean)
-                
-                # Evaluate
-                results = detector.evaluate(st.session_state.df_scaled, true_labels)
-                
-                # Save to session state
-                st.session_state.detector = detector
-                st.session_state.results = results
-                st.session_state.true_labels = true_labels
-                st.session_state.model_trained = True
-                
-                st.success("✅ Model training complete!")
+        df = st.session_state.predictions
+        anomalies = df[df['is_anomaly_pred'] == 1]
         
-        if st.session_state.model_trained:
-            results = st.session_state.results
-            
-            st.subheader("📊 Model Performance")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Precision", f"{results.get('precision', 0):.2%}")
-            with col2:
-                st.metric("Recall", f"{results.get('recall', 0):.2%}")
-            with col3:
-                st.metric("F1-Score", f"{results.get('f1_score', 0):.2%}")
-            with col4:
-                st.metric("Anomalies Detected", f"{results['n_anomalies']}")
-            
-            # Confusion Matrix
-            if 'confusion_matrix' in results:
-                st.subheader("Confusion Matrix")
-                cm = results['confusion_matrix']
-                fig = px.imshow(cm, 
-                              labels=dict(x="Predicted", y="Actual", color="Count"),
-                              x=['Normal', 'Anomaly'],
-                              y=['Normal', 'Anomaly'],
-                              text_auto=True,
-                              color_continuous_scale='Blues')
-                st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("👈 Please preprocess data first")
-
-# Tab 4: Results & Analysis
-with tab4:
-    st.header("📈 Detection Results & Analysis")
-    
-    if st.session_state.model_trained:
-        results = st.session_state.results
-        df_clean = st.session_state.df_clean.copy()
+        st.subheader("🚨 Top Detected Anomalies")
+        st.write("These sessions have the highest anomaly scores (most deviant behavior).")
         
-        # Add scores to dataframe
-        df_clean['anomaly_score'] = results['anomaly_scores']
-        df_clean['is_anomaly'] = results['predictions']
+        # Sort by score descending
+        top_anomalies = anomalies.sort_values('anomaly_score', ascending=False).head(10)
+        st.dataframe(top_anomalies[['user_id', 'files_accessed', 'failed_logins', 
+                                    'data_outbound_mb', 'cpu_usage', 'file_encryption_rate', 
+                                    'anomaly_score']], use_container_width=True)
         
-        # Anomaly Score Distribution
-        st.subheader("📊 Anomaly Score Distribution")
-        fig = px.histogram(df_clean, x='anomaly_score', 
-                          color='is_anomaly',
-                          nbins=50,
-                          labels={'is_anomaly': 'Anomaly'},
-                          title="Distribution of Anomaly Scores")
-        st.plotly_chart(fig, use_container_width=True)
+        st.divider()
+        st.subheader("Feature Correlation Analysis")
         
-        # Top Anomalies
-        st.subheader("🚨 Top 10 Anomalous Sessions")
-        top_anomalies = df_clean.nlargest(10, 'anomaly_score')[[
-            'user_id_original', 'files_accessed', 'failed_logins',
-            'data_outbound_mb', 'cpu_usage', 'file_encryption_rate',
-            'anomaly_score'
-        ]]
-        st.dataframe(top_anomalies, use_container_width=True)
-        
-        # Feature Correlation Heatmap
-        st.subheader("🔥 Feature Correlation Heatmap")
-        numerical_cols = df_clean.select_dtypes(include=[np.number]).columns
-        numerical_cols = [col for col in numerical_cols if col not in ['user_id_encoded', 'is_anomaly']]
-        
-        corr_matrix = df_clean[numerical_cols].corr()
-        fig = px.imshow(corr_matrix,
-                       labels=dict(color="Correlation"),
-                       x=corr_matrix.columns,
-                       y=corr_matrix.columns,
-                       color_continuous_scale='RdBu_r',
-                       zmin=-1, zmax=1)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Scatter plots
-        st.subheader("🔍 Anomaly Visualization")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.scatter(df_clean, 
-                           x='file_encryption_rate', 
-                           y='cpu_usage',
-                           color='is_anomaly',
-                           title="File Encryption vs CPU Usage",
-                           labels={'is_anomaly': 'Anomaly'})
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.scatter(df_clean,
-                           x='data_outbound_mb',
-                           y='failed_logins',
-                           color='is_anomaly',
-                           title="Data Outbound vs Failed Logins",
-                           labels={'is_anomaly': 'Anomaly'})
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Download results
-        st.subheader("💾 Export Results")
-        csv = df_clean.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Results with Anomaly Scores",
-            data=csv,
-            file_name="banking_logs_with_anomaly_scores.csv",
-            mime="text/csv"
+        # 3D Scatter Plot
+        fig_3d = px.scatter_3d(
+            df.sample(min(2000, len(df))), # Sample to keep UI fast
+            x='files_accessed', 
+            y='file_encryption_rate', 
+            z='cpu_usage',
+            color='is_anomaly_pred',
+            color_discrete_map={0: 'blue', 1: 'red'},
+            title="3D View: Files vs Encryption vs CPU",
+            opacity=0.7
         )
-    else:
-        st.info("👈 Please train model first")
+        st.plotly_chart(fig_3d, use_container_width=True)
+        
+        col_scatter1, col_scatter2 = st.columns(2)
+        
+        with col_scatter1:
+            fig_scat1 = px.scatter(
+                df, x="files_accessed", y="data_outbound_mb", color="is_anomaly_pred",
+                title="Data Exfiltration Patterns",
+                color_discrete_map={0: "blue", 1: "red"}
+            )
+            st.plotly_chart(fig_scat1, use_container_width=True)
+            
+        with col_scatter2:
+            fig_scat2 = px.scatter(
+                df, x="failed_logins", y="session_duration", color="is_anomaly_pred",
+                title="Brute Force Patterns",
+                color_discrete_map={0: "blue", 1: "red"}
+            )
+            st.plotly_chart(fig_scat2, use_container_width=True)
 
-# Tab 5: Real-time Simulation
-with tab5:
-    st.header("🔴 Real-time Log Simulation")
-    st.markdown("Simulate live banking activity monitoring")
+# --- TAB 3: LIVE SIMULATION ---
+with tab3:
+    st.subheader("🔴 Real-Time Threat Monitor")
+    st.write("Simulate incoming traffic logs and detect threats instantly.")
     
-    if st.session_state.model_trained:
-        col1, col2 = st.columns([1, 3])
-        
-        with col1:
-            if st.button("▶️ Start Simulation", type="primary"):
-                st.session_state.simulation_running = True
+    col_sim_btn, col_sim_stat = st.columns([1, 3])
+    
+    with col_sim_btn:
+        run_sim = st.toggle("Start Monitoring")
+    
+    if run_sim and st.session_state.model is not None:
+        placeholder = st.empty()
+        # Simulation loop
+        for i in range(100):
+            if not run_sim: break
             
-            if st.button("⏸️ Stop Simulation"):
-                st.session_state.simulation_running = False
-        
-        if 'simulation_running' in st.session_state and st.session_state.simulation_running:
-            placeholder = st.empty()
+            # Generate 1 random log
+            new_log = generate_banking_data(1) 
             
-            for i in range(10):
-                # Generate new log entry
-                new_log = generate_banking_data(1)
-                
-                # Preprocess
-                preprocessor = DataPreprocessor()
-                new_scaled, new_clean = preprocessor.preprocess(new_log)
-                
-                # Predict
-                detector = st.session_state.detector
-                anomaly_scores, predictions = detector.predict(new_scaled)
-                
-                # Display
-                with placeholder.container():
-                    st.subheader(f"📡 Live Log #{i+1}")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("User", new_clean['user_id_original'].values[0])
-                    with col2:
-                        st.metric("Anomaly Score", f"{anomaly_scores[0]:.3f}")
-                    with col3:
-                        if predictions[0] == 1:
-                            st.error("🚨 ANOMALY DETECTED!")
-                        else:
-                            st.success("✅ Normal Activity")
-                    
-                    st.dataframe(new_clean, use_container_width=True)
-                
-                time.sleep(2)
+            # Preprocess
+            processed_log = preprocess_data(new_log)
             
-            st.session_state.simulation_running = False
-            st.success("Simulation complete!")
-    else:
-        st.info("👈 Please train model first")
-
-# Footer
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray;'>"
-    "🛡️ Proactive Ransomware Detection System | "
-    "Built with Streamlit & Scikit-learn | "
-    "Unsupervised Machine Learning for Banking Security"
-    "</div>",
-    unsafe_allow_html=True
-)
+            # Prepare features
+            X_new = processed_log[st.session_state.features].values
+            X_new_scaled = st.session_state.scaler.transform(X_new)
+            
+            # Predict
+            pred = st.session_state.model.predict(X_new_scaled)
+            score = -st.session_state.model.score_samples(X_new_scaled)
+            
+            is_threat = pred[0] == -1
+            
+            with placeholder.container():
+                # Dynamic Status Card
+                if is_threat:
+                    st.error(f"⚠️ THREAT DETECTED at {time.strftime('%H:%M:%S')}")
+                    st.metric("Anomaly Score", f"{score[0]:.4f}", delta="High Risk", delta_color="inverse")
+                else:
+                    st.success(f"✅ Normal Activity at {time.strftime('%H:%M:%S')}")
+                    st.metric("Anomaly Score", f"{score[0]:.4f}", delta="Low Risk")
+                
+                st.write("**Incoming Log Details:**")
+                st.dataframe(new_log[['user_id', 'files_accessed', 'cpu_usage', 'file_encryption_rate', 'data_outbound_mb']])
+                
+            time.sleep(1.5)
+            
+    elif run_sim and st.session_state.model is None:
+        st.warning("Please train the model in the Sidebar first!")
