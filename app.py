@@ -3,17 +3,16 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 import time
 
-# Import the data generator from your provided file
 from generate_data import generate_banking_data
+from ensemble_models import EnsembleAnomalyDetector, compare_ensemble_strategies
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="🛡️ Ransomware Detection System",
+    page_title="🛡️ Ensemble Ransomware Detection",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -41,6 +40,14 @@ st.markdown("""
         padding: 15px;
         box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
     }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        padding-left: 20px;
+        padding-right: 20px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -49,27 +56,25 @@ if 'data' not in st.session_state:
     st.session_state.data = None
 if 'clean_data' not in st.session_state:
     st.session_state.clean_data = None
-if 'model' not in st.session_state:
-    st.session_state.model = None
+if 'ensemble_model' not in st.session_state:
+    st.session_state.ensemble_model = None
 if 'predictions' not in st.session_state:
     st.session_state.predictions = None
-if 'scaler' not in st.session_state:
-    st.session_state.scaler = None
+if 'metrics' not in st.session_state:
+    st.session_state.metrics = None
 
-# --- HELPER FUNCTIONS (Logic moved from quick_run.py) ---
+# --- HELPER FUNCTIONS ---
 
 def preprocess_data(df_raw):
-    """
-    Cleans the raw dataframe based on logic from quick_run.py
-    """
+    """Clean and preprocess data"""
     df = df_raw.copy()
     
-    # 1. Handle missing values
+    # Handle missing values
     for col in df.select_dtypes(include=[np.number]).columns:
         if df[col].isnull().sum() > 0:
             df[col] = df[col].fillna(df[col].median())
-            
-    # 2. Fix invalid ranges
+    
+    # Fix invalid ranges
     if 'cpu_usage' in df.columns:
         df['cpu_usage'] = df['cpu_usage'].clip(0, 100)
     if 'data_outbound_mb' in df.columns:
@@ -78,54 +83,18 @@ def preprocess_data(df_raw):
         df['hour_of_day'] = df['hour_of_day'].clip(0, 23)
     if 'failed_logins' in df.columns:
         df['failed_logins'] = df['failed_logins'].clip(lower=0)
-
-    # 3. Remove duplicates
+    
     df = df.drop_duplicates()
     
-    # 4. Encode user_id
+    # Encode user_id
     if 'user_id' in df.columns:
         le = LabelEncoder()
         df['user_id_encoded'] = le.fit_transform(df['user_id'])
-        
+    
     return df
 
-def train_and_predict(df, contamination=0.03):
-    """
-    Trains Isolation Forest and generates predictions
-    """
-    # Select features
-    exclude_cols = ['user_id', 'timestamp', 'user_id_encoded', 'is_anomaly', 'anomaly_type'] 
-    feature_cols = [col for col in df.columns if col not in exclude_cols 
-                    and df[col].dtype in [np.float64, np.int64]]
-    
-    X = df[feature_cols].values
-    
-    # Scale
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Train Isolation Forest
-    model = IsolationForest(
-        contamination=contamination,
-        random_state=42,
-        n_estimators=100,
-        n_jobs=-1
-    )
-    model.fit(X_scaled)
-    
-    # Predict
-    # -1 is anomaly, 1 is normal in sklearn
-    # We convert to: 1 = anomaly, 0 = normal
-    raw_predictions = model.predict(X_scaled)
-    anomaly_scores = -model.score_samples(X_scaled)
-    is_anomaly = (raw_predictions == -1).astype(int)
-    
-    return model, scaler, is_anomaly, anomaly_scores, feature_cols
-
 def generate_ground_truth(df):
-    """
-    Recreates the ground truth logic from quick_run.py for evaluation
-    """
+    """Create ground truth labels"""
     true_labels = np.zeros(len(df))
     conditions = (
         (df['file_encryption_rate'] > 10) |
@@ -138,19 +107,44 @@ def generate_ground_truth(df):
 
 # --- UI LAYOUT ---
 
-st.markdown("<h1 class='main-header'>🛡️ Proactive Ransomware Detection</h1>", unsafe_allow_html=True)
-st.markdown("<div class='sub-header'>Unsupervised Anomaly Detection for Banking Logs</div>", unsafe_allow_html=True)
+st.markdown("<h1 class='main-header'>🛡️ Multi-Model Ensemble Ransomware Detection</h1>", unsafe_allow_html=True)
+st.markdown("<div class='sub-header'>Advanced Anomaly Detection with Ensemble Learning</div>", unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
-    st.subheader("Data Generation")
+    
+    st.subheader("📊 Data Generation")
     n_records = st.slider("Number of Records", 1000, 20000, 5000, step=1000)
     
-    st.subheader("Model Settings")
+    st.subheader("🤖 Ensemble Settings")
     contamination = st.slider("Expected Contamination (%)", 1, 10, 3) / 100.0
     
-    if st.button("🔄 Generate & Train", type="primary"):
+    voting_method = st.radio(
+        "Voting Strategy",
+        ["soft", "hard"],
+        help="Soft: Average scores | Hard: Majority vote"
+    )
+    
+    st.subheader("🎯 Model Selection")
+    use_isolation_forest = st.checkbox("Isolation Forest", value=True)
+    use_lof = st.checkbox("Local Outlier Factor", value=True)
+    use_elliptic = st.checkbox("Elliptic Envelope", value=True)
+    use_svm = st.checkbox("One-Class SVM", value=True)
+    
+    model_subset = []
+    if use_isolation_forest:
+        model_subset.append('isolation_forest')
+    if use_lof:
+        model_subset.append('lof')
+    if use_elliptic:
+        model_subset.append('elliptic_envelope')
+    if use_svm:
+        model_subset.append('one_class_svm')
+    
+    st.divider()
+    
+    if st.button("🚀 Generate & Train Ensemble", type="primary", disabled=len(model_subset)==0):
         with st.spinner("Generating synthetic data..."):
             raw_data = generate_banking_data(n_records)
             st.session_state.data = raw_data
@@ -158,161 +152,351 @@ with st.sidebar:
         with st.spinner("Preprocessing & Cleaning..."):
             clean_df = preprocess_data(raw_data)
             st.session_state.clean_data = clean_df
+        
+        # Prepare features
+        exclude_cols = ['user_id', 'timestamp', 'user_id_encoded']
+        feature_cols = [col for col in clean_df.columns if col not in exclude_cols 
+                       and clean_df[col].dtype in [np.float64, np.int64]]
+        X = clean_df[feature_cols].values
+        
+        with st.spinner(f"Training Ensemble ({len(model_subset)} models)..."):
+            # Train ensemble
+            ensemble = EnsembleAnomalyDetector(
+                contamination=contamination,
+                voting=voting_method,
+                weights=None
+            )
+            ensemble.fit(X, model_subset=model_subset)
+            st.session_state.ensemble_model = ensemble
             
-        with st.spinner("Training Isolation Forest..."):
-            model, scaler, preds, scores, features = train_and_predict(clean_df, contamination)
-            st.session_state.model = model
-            st.session_state.scaler = scaler
+            # Get predictions
+            preds, scores, ind_preds, ind_scores = ensemble.predict(X)
             
-            # Combine results
-            clean_df['is_anomaly_pred'] = preds
-            clean_df['anomaly_score'] = scores
-            clean_df['true_label'] = generate_ground_truth(clean_df)
+            # Generate ground truth
+            true_labels = generate_ground_truth(clean_df)
+            
+            # Evaluate
+            metrics = ensemble.evaluate(X, true_labels)
+            st.session_state.metrics = metrics
+            
+            # Store results
+            clean_df['ensemble_prediction'] = preds
+            clean_df['ensemble_score'] = scores
+            clean_df['true_label'] = true_labels
+            
+            for model_name in ensemble.model_names:
+                clean_df[f'{model_name}_pred'] = ind_preds[model_name]
+                clean_df[f'{model_name}_score'] = ind_scores[model_name]
+            
             st.session_state.predictions = clean_df
-            st.session_state.features = features
-            
-        st.success("Pipeline Completed Successfully!")
+        
+        st.success("✅ Ensemble Training Complete!")
+    
+    if len(model_subset) == 0:
+        st.warning("⚠️ Select at least one model")
 
 # Main Content Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Data & Performance", "🔍 Anomaly Investigation", "🔴 Live Simulation"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Ensemble Performance", 
+    "🔍 Model Comparison", 
+    "🎯 Anomaly Investigation",
+    "🔴 Live Detection"
+])
 
-# --- TAB 1: DATA & PERFORMANCE ---
+# --- TAB 1: ENSEMBLE PERFORMANCE ---
 with tab1:
     if st.session_state.predictions is None:
-        st.info("👈 Click 'Generate & Train' in the sidebar to start the system.")
+        st.info("👈 Configure and train the ensemble in the sidebar to begin")
     else:
         df = st.session_state.predictions
+        metrics = st.session_state.metrics
         
         # Metrics Row
-        col1, col2, col3, col4 = st.columns(4)
+        st.subheader("🎯 Ensemble Performance Metrics")
+        col1, col2, col3, col4, col5 = st.columns(5)
         
-        n_anomalies = df['is_anomaly_pred'].sum()
-        precision = precision_score(df['true_label'], df['is_anomaly_pred'])
-        recall = recall_score(df['true_label'], df['is_anomaly_pred'])
-        f1 = f1_score(df['true_label'], df['is_anomaly_pred'])
+        n_anomalies = df['ensemble_prediction'].sum()
+        ensemble_metrics = metrics['ensemble']
         
-        col1.metric("Total Records", len(df))
-        col2.metric("Anomalies Detected", f"{n_anomalies} ({n_anomalies/len(df):.1%})")
-        col3.metric("Precision", f"{precision:.2%}")
-        col4.metric("Recall (Sensitivity)", f"{recall:.2%}")
+        col1.metric("Total Records", f"{len(df):,}")
+        col2.metric("Anomalies", f"{n_anomalies} ({n_anomalies/len(df):.1%})")
+        col3.metric("Precision", f"{ensemble_metrics['precision']:.1%}")
+        col4.metric("Recall", f"{ensemble_metrics['recall']:.1%}")
+        col5.metric("F1-Score", f"{ensemble_metrics['f1_score']:.1%}")
         
         st.divider()
         
         col_chart1, col_chart2 = st.columns(2)
         
         with col_chart1:
-            st.subheader("Anomaly Score Distribution")
-            fig_hist = px.histogram(df, x="anomaly_score", color="is_anomaly_pred", 
-                                    nbins=50, title="Distribution of Isolation Forest Scores",
-                                    color_discrete_map={0: "blue", 1: "red"},
-                                    labels={"is_anomaly_pred": "Detected Anomaly"})
+            st.subheader("Ensemble Score Distribution")
+            fig_hist = px.histogram(
+                df, x="ensemble_score", 
+                color="ensemble_prediction",
+                nbins=50,
+                title="Ensemble Anomaly Scores",
+                color_discrete_map={0: "#3498db", 1: "#e74c3c"},
+                labels={"ensemble_prediction": "Prediction"}
+            )
             st.plotly_chart(fig_hist, use_container_width=True)
-            
+        
         with col_chart2:
             st.subheader("Confusion Matrix")
-            # Simple confusion matrix viz
-            cm_data = pd.crosstab(df['true_label'], df['is_anomaly_pred'], 
-                                  rownames=['Actual'], colnames=['Predicted'])
-            fig_cm = px.imshow(cm_data, text_auto=True, color_continuous_scale='Blues',
-                               title="Confusion Matrix (Actual vs Predicted)")
+            cm = confusion_matrix(df['true_label'], df['ensemble_prediction'])
+            fig_cm = px.imshow(
+                cm, 
+                text_auto=True,
+                labels=dict(x="Predicted", y="Actual"),
+                x=['Normal', 'Anomaly'],
+                y=['Normal', 'Anomaly'],
+                color_continuous_scale='RdYlGn_r',
+                title="Ensemble Predictions vs Ground Truth"
+            )
             st.plotly_chart(fig_cm, use_container_width=True)
-
-# --- TAB 2: ANOMALY INVESTIGATION ---
-with tab2:
-    if st.session_state.predictions is None:
-        st.info("Please train the model first.")
-    else:
-        df = st.session_state.predictions
-        anomalies = df[df['is_anomaly_pred'] == 1]
-        
-        st.subheader("🚨 Top Detected Anomalies")
-        st.write("These sessions have the highest anomaly scores (most deviant behavior).")
-        
-        # Sort by score descending
-        top_anomalies = anomalies.sort_values('anomaly_score', ascending=False).head(10)
-        st.dataframe(top_anomalies[['user_id', 'files_accessed', 'failed_logins', 
-                                    'data_outbound_mb', 'cpu_usage', 'file_encryption_rate', 
-                                    'anomaly_score']], use_container_width=True)
         
         st.divider()
-        st.subheader("Feature Correlation Analysis")
         
-        # 3D Scatter Plot
+        # Agreement Analysis
+        st.subheader("🤝 Model Agreement Analysis")
+        
+        # Calculate agreement
+        model_cols = [col for col in df.columns if col.endswith('_pred')]
+        if len(model_cols) > 1:
+            agreement = df[model_cols].sum(axis=1)
+            df['model_agreement'] = agreement
+            
+            fig_agreement = px.histogram(
+                df, x="model_agreement",
+                title=f"Number of Models Detecting Each Sample as Anomaly (out of {len(model_cols)})",
+                labels={"model_agreement": "Number of Models Agreeing"},
+                color_discrete_sequence=['#9b59b6']
+            )
+            st.plotly_chart(fig_agreement, use_container_width=True)
+            
+            # High agreement anomalies
+            high_agreement = df[df['model_agreement'] >= len(model_cols) * 0.75]
+            st.info(f"🎯 **{len(high_agreement)} samples** detected by ≥75% of models (high confidence)")
+
+# --- TAB 2: MODEL COMPARISON ---
+with tab2:
+    if st.session_state.metrics is None:
+        st.info("Please train the ensemble first")
+    else:
+        metrics = st.session_state.metrics
+        df = st.session_state.predictions
+        
+        st.subheader("📈 Individual Model Performance")
+        
+        # Create comparison dataframe
+        comparison_data = []
+        for model_name, model_metrics in metrics['individual_models'].items():
+            comparison_data.append({
+                'Model': model_name.replace('_', ' ').title(),
+                'Precision': model_metrics['precision'],
+                'Recall': model_metrics['recall'],
+                'F1-Score': model_metrics['f1_score']
+            })
+        
+        # Add ensemble
+        comparison_data.append({
+            'Model': 'ENSEMBLE',
+            'Precision': metrics['ensemble']['precision'],
+            'Recall': metrics['ensemble']['recall'],
+            'F1-Score': metrics['ensemble']['f1_score']
+        })
+        
+        comp_df = pd.DataFrame(comparison_data)
+        
+        # Visualization
+        fig_comparison = go.Figure()
+        
+        metrics_to_plot = ['Precision', 'Recall', 'F1-Score']
+        colors = ['#3498db', '#e74c3c', '#2ecc71']
+        
+        for i, metric in enumerate(metrics_to_plot):
+            fig_comparison.add_trace(go.Bar(
+                name=metric,
+                x=comp_df['Model'],
+                y=comp_df[metric],
+                marker_color=colors[i],
+                text=[f"{val:.1%}" for val in comp_df[metric]],
+                textposition='outside'
+            ))
+        
+        fig_comparison.update_layout(
+            title="Model Performance Comparison",
+            xaxis_title="Model",
+            yaxis_title="Score",
+            barmode='group',
+            height=500,
+            yaxis=dict(range=[0, 1.1])
+        )
+        
+        st.plotly_chart(fig_comparison, use_container_width=True)
+        
+        st.divider()
+        
+        # Detailed metrics table
+        st.subheader("📊 Detailed Metrics Table")
+        st.dataframe(
+            comp_df.style.format({
+                'Precision': '{:.2%}',
+                'Recall': '{:.2%}',
+                'F1-Score': '{:.2%}'
+            }).background_gradient(subset=['Precision', 'Recall', 'F1-Score'], cmap='RdYlGn'),
+            use_container_width=True
+        )
+        
+        # Model disagreement analysis
+        st.divider()
+        st.subheader("🔍 Model Disagreement Cases")
+        
+        model_pred_cols = [col for col in df.columns if col.endswith('_pred')]
+        if len(model_pred_cols) > 1:
+            # Find cases where models disagree
+            df['prediction_variance'] = df[model_pred_cols].var(axis=1)
+            disagreement_cases = df[df['prediction_variance'] > 0].nlargest(10, 'ensemble_score')
+            
+            st.write("Top 10 cases with highest model disagreement:")
+            display_cols = ['user_id', 'ensemble_score', 'ensemble_prediction'] + model_pred_cols + ['true_label']
+            st.dataframe(disagreement_cases[display_cols], use_container_width=True)
+
+# --- TAB 3: ANOMALY INVESTIGATION ---
+with tab3:
+    if st.session_state.predictions is None:
+        st.info("Please train the ensemble first")
+    else:
+        df = st.session_state.predictions
+        anomalies = df[df['ensemble_prediction'] == 1]
+        
+        st.subheader("🚨 Detected Anomalies")
+        
+        col_metric1, col_metric2, col_metric3 = st.columns(3)
+        col_metric1.metric("Total Anomalies", len(anomalies))
+        col_metric2.metric("True Positives", len(anomalies[anomalies['true_label']==1]))
+        col_metric3.metric("False Positives", len(anomalies[anomalies['true_label']==0]))
+        
+        st.divider()
+        
+        # Top anomalies
+        st.subheader("🔝 Top 10 Most Anomalous Sessions")
+        top_anomalies = df.nlargest(10, 'ensemble_score')
+        
+        display_cols = ['user_id', 'files_accessed', 'failed_logins', 'data_outbound_mb', 
+                       'cpu_usage', 'file_encryption_rate', 'ensemble_score', 
+                       'ensemble_prediction', 'true_label']
+        
+        st.dataframe(
+            top_anomalies[display_cols].style.background_gradient(
+                subset=['ensemble_score'], cmap='Reds'
+            ),
+            use_container_width=True
+        )
+        
+        st.divider()
+        
+        # 3D Visualization
+        st.subheader("🎨 3D Feature Space Visualization")
+        
+        sample_size = min(2000, len(df))
+        df_sample = df.sample(sample_size)
+        
         fig_3d = px.scatter_3d(
-            df.sample(min(2000, len(df))), # Sample to keep UI fast
-            x='files_accessed', 
-            y='file_encryption_rate', 
+            df_sample,
+            x='files_accessed',
+            y='file_encryption_rate',
             z='cpu_usage',
-            color='is_anomaly_pred',
-            color_discrete_map={0: 'blue', 1: 'red'},
-            title="3D View: Files vs Encryption vs CPU",
+            color='ensemble_prediction',
+            color_discrete_map={0: '#3498db', 1: '#e74c3c'},
+            size='ensemble_score',
+            size_max=10,
+            title="Anomaly Detection in 3D Feature Space",
+            labels={'ensemble_prediction': 'Prediction'},
             opacity=0.7
         )
         st.plotly_chart(fig_3d, use_container_width=True)
         
-        col_scatter1, col_scatter2 = st.columns(2)
+        # Feature correlations
+        col_scat1, col_scat2 = st.columns(2)
         
-        with col_scatter1:
-            fig_scat1 = px.scatter(
-                df, x="files_accessed", y="data_outbound_mb", color="is_anomaly_pred",
-                title="Data Exfiltration Patterns",
-                color_discrete_map={0: "blue", 1: "red"}
+        with col_scat1:
+            fig_s1 = px.scatter(
+                df_sample, x="files_accessed", y="data_outbound_mb",
+                color="ensemble_prediction",
+                color_discrete_map={0: '#3498db', 1: '#e74c3c'},
+                title="Data Exfiltration Pattern"
             )
-            st.plotly_chart(fig_scat1, use_container_width=True)
-            
-        with col_scatter2:
-            fig_scat2 = px.scatter(
-                df, x="failed_logins", y="session_duration", color="is_anomaly_pred",
-                title="Brute Force Patterns",
-                color_discrete_map={0: "blue", 1: "red"}
+            st.plotly_chart(fig_s1, use_container_width=True)
+        
+        with col_scat2:
+            fig_s2 = px.scatter(
+                df_sample, x="failed_logins", y="session_duration",
+                color="ensemble_prediction",
+                color_discrete_map={0: '#3498db', 1: '#e74c3c'},
+                title="Brute Force Pattern"
             )
-            st.plotly_chart(fig_scat2, use_container_width=True)
+            st.plotly_chart(fig_s2, use_container_width=True)
 
-# --- TAB 3: LIVE SIMULATION ---
-with tab3:
+# --- TAB 4: LIVE DETECTION ---
+with tab4:
     st.subheader("🔴 Real-Time Threat Monitor")
-    st.write("Simulate incoming traffic logs and detect threats instantly.")
+    st.write("Simulate live traffic and detect anomalies in real-time using the ensemble.")
     
-    col_sim_btn, col_sim_stat = st.columns([1, 3])
+    col_btn, col_status = st.columns([1, 3])
     
-    with col_sim_btn:
-        run_sim = st.toggle("Start Monitoring")
+    with col_btn:
+        run_simulation = st.toggle("▶️ Start Monitoring")
     
-    if run_sim and st.session_state.model is not None:
+    if run_simulation and st.session_state.ensemble_model is not None:
         placeholder = st.empty()
-        # Simulation loop
-        for i in range(100):
-            if not run_sim: break
+        
+        # Get feature columns
+        exclude_cols = ['user_id', 'timestamp', 'user_id_encoded', 'ensemble_prediction',
+                       'ensemble_score', 'true_label'] + [col for col in st.session_state.predictions.columns 
+                                                           if '_pred' in col or '_score' in col]
+        feature_cols = [col for col in st.session_state.clean_data.columns 
+                       if col not in exclude_cols and st.session_state.clean_data[col].dtype in [np.float64, np.int64]]
+        
+        for i in range(50):
+            if not run_simulation:
+                break
             
-            # Generate 1 random log
-            new_log = generate_banking_data(1) 
-            
-            # Preprocess
-            processed_log = preprocess_data(new_log)
-            
-            # Prepare features
-            X_new = processed_log[st.session_state.features].values
-            X_new_scaled = st.session_state.scaler.transform(X_new)
+            # Generate new sample
+            new_sample = generate_banking_data(1)
+            processed = preprocess_data(new_sample)
             
             # Predict
-            pred = st.session_state.model.predict(X_new_scaled)
-            score = -st.session_state.model.score_samples(X_new_scaled)
+            X_new = processed[feature_cols].values
+            preds, scores, _, _ = st.session_state.ensemble_model.predict(X_new)
             
-            is_threat = pred[0] == -1
+            is_threat = preds[0] == 1
+            score = scores[0]
             
             with placeholder.container():
-                # Dynamic Status Card
+                current_time = time.strftime('%H:%M:%S')
+                
                 if is_threat:
-                    st.error(f"⚠️ THREAT DETECTED at {time.strftime('%H:%M:%S')}")
-                    st.metric("Anomaly Score", f"{score[0]:.4f}", delta="High Risk", delta_color="inverse")
+                    st.error(f"⚠️ **THREAT DETECTED** at {current_time}")
+                    st.metric("🚨 Anomaly Score", f"{score:.4f}", delta="HIGH RISK", delta_color="inverse")
                 else:
-                    st.success(f"✅ Normal Activity at {time.strftime('%H:%M:%S')}")
-                    st.metric("Anomaly Score", f"{score[0]:.4f}", delta="Low Risk")
+                    st.success(f"✅ **Normal Activity** at {current_time}")
+                    st.metric("✓ Anomaly Score", f"{score:.4f}", delta="Low Risk")
                 
                 st.write("**Incoming Log Details:**")
-                st.dataframe(new_log[['user_id', 'files_accessed', 'cpu_usage', 'file_encryption_rate', 'data_outbound_mb']])
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Files Accessed", int(new_sample['files_accessed'].iloc[0]))
+                col2.metric("CPU Usage", f"{new_sample['cpu_usage'].iloc[0]:.1f}%")
+                col3.metric("Data Out (MB)", f"{new_sample['data_outbound_mb'].iloc[0]:.1f}")
                 
-            time.sleep(1.5)
+                col4, col5, col6 = st.columns(3)
+                col4.metric("Encryption Rate", f"{new_sample['file_encryption_rate'].iloc[0]:.1f}/min")
+                col5.metric("Failed Logins", int(new_sample['failed_logins'].iloc[0]))
+                col6.metric("Session (sec)", int(new_sample['session_duration'].iloc[0]))
             
-    elif run_sim and st.session_state.model is None:
-        st.warning("Please train the model in the Sidebar first!")
+            time.sleep(1.5)
+    
+    elif run_simulation and st.session_state.ensemble_model is None:
+        st.warning("⚠️ Please train the ensemble model first!")
+    
+    if not run_simulation:
+        st.info("Click the toggle above to start real-time monitoring simulation")

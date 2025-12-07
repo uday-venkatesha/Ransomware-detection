@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Quick Pipeline Runner - Simplified version without TensorFlow dependencies
-Runs only Isolation Forest model to avoid threading issues
+Quick Pipeline Runner - Enhanced with Multi-Model Ensemble
+Demonstrates improved detection using ensemble methods
 """
 
 import sys
@@ -15,14 +15,15 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import precision_score, recall_score, f1_score
 import warnings
 warnings.filterwarnings('ignore')
 
+from ensemble_models import EnsembleAnomalyDetector, compare_ensemble_strategies
+
 print("="*70)
-print("🛡️  RANSOMWARE DETECTION - QUICK RUN")
+print("🛡️  RANSOMWARE DETECTION - ENSEMBLE QUICK RUN")
 print("="*70)
 print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -78,8 +79,8 @@ df['user_id_encoded'] = le.fit_transform(df['user_id'])
 df.to_csv("banking_logs_clean.csv", index=False)
 print(f"✅ Cleaned {len(df)} records\n")
 
-# STEP 3: Train Model
-print("🤖 Step 3: Training Model...")
+# STEP 3: Train Ensemble Model
+print("🤖 Step 3: Training Multi-Model Ensemble...")
 print("-"*70)
 
 # Prepare features
@@ -89,36 +90,10 @@ feature_cols = [col for col in df.columns if col not in exclude_cols
 
 X = df[feature_cols].values
 
-# Scale features
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+print(f"Training on {X.shape[0]} samples with {X.shape[1]} features...")
 
-print(f"Training on {X_scaled.shape[0]} samples with {X_scaled.shape[1]} features...")
-
-# Train Isolation Forest
-print("Training Isolation Forest...")
-model = IsolationForest(
-    contamination=0.03,
-    random_state=42,
-    n_estimators=100,
-    n_jobs=1,  # Single thread to avoid issues
-    verbose=0
-)
-
-model.fit(X_scaled)
-print("✅ Model trained successfully\n")
-
-# STEP 4: Predict and Evaluate
-print("📈 Step 4: Generating Predictions...")
-print("-"*70)
-
-# Predict
-anomaly_scores = -model.score_samples(X_scaled)
-predictions = model.predict(X_scaled)
-is_anomaly = (predictions == -1).astype(int)
-
-# Create ground truth
-print("Creating ground truth labels for evaluation...")
+# Create ground truth for evaluation
+print("\nCreating ground truth labels...")
 true_labels = np.zeros(len(df))
 conditions = (
     (df['file_encryption_rate'] > 10) |
@@ -127,51 +102,112 @@ conditions = (
     ((df['files_accessed'] > 500) & (df['cpu_usage'] > 70))
 )
 true_labels[conditions] = 1
+print(f"True anomalies in dataset: {int(true_labels.sum())} ({true_labels.mean()*100:.1f}%)")
 
-# Calculate metrics
-precision = precision_score(true_labels, is_anomaly, zero_division=0)
-recall = recall_score(true_labels, is_anomaly, zero_division=0)
-f1 = f1_score(true_labels, is_anomaly, zero_division=0)
+# Train ensemble
+print("\nInitializing Ensemble Detector...")
+ensemble = EnsembleAnomalyDetector(
+    contamination=0.03,
+    voting='soft',
+    weights=None  # Equal weights initially
+)
+
+ensemble.fit(X)
+
+# Get predictions
+print("\n📈 Step 4: Generating Ensemble Predictions...")
+print("-"*70)
+
+predictions, scores, individual_preds, individual_scores = ensemble.predict(X)
+
+# Evaluate
+metrics = ensemble.evaluate(X, true_labels)
 
 # Add results to dataframe
-df['anomaly_score'] = anomaly_scores
-df['is_anomaly'] = is_anomaly
+df['ensemble_score'] = scores
+df['ensemble_prediction'] = predictions
 df['true_label'] = true_labels
 
+# Add individual model predictions
+for model_name in ensemble.model_names:
+    df[f'{model_name}_pred'] = individual_preds[model_name]
+    df[f'{model_name}_score'] = individual_scores[model_name]
+
 # Save results
-df.to_csv("banking_logs_with_scores.csv", index=False)
+df.to_csv("banking_logs_ensemble_results.csv", index=False)
+ensemble.save("ensemble_model.pkl")
 
 print("\n" + "="*70)
-print("📊 RESULTS SUMMARY")
+print("📊 ENSEMBLE RESULTS SUMMARY")
 print("="*70)
-print(f"Model Performance:")
-print(f"  • Precision:  {precision:.2%}")
-print(f"  • Recall:     {recall:.2%}")
-print(f"  • F1-Score:   {f1:.2%}")
-print(f"  • Anomalies:  {is_anomaly.sum()} / {len(df)} ({is_anomaly.mean()*100:.1f}%)")
-print(f"  • True Anomalies: {int(true_labels.sum())}")
-print()
 
-print("📁 Output Files Created:")
+print("\n🎯 Ensemble Performance:")
+print(f"  • Precision:  {metrics['ensemble']['precision']:.2%}")
+print(f"  • Recall:     {metrics['ensemble']['recall']:.2%}")
+print(f"  • F1-Score:   {metrics['ensemble']['f1_score']:.2%}")
+print(f"  • Anomalies:  {predictions.sum()} / {len(df)} ({predictions.mean()*100:.1f}%)")
+
+print("\n📈 Individual Model Performance:")
+print("-"*70)
+for model_name, model_metrics in metrics['individual_models'].items():
+    print(f"\n{model_name.upper()}:")
+    print(f"  • Precision: {model_metrics['precision']:.2%}")
+    print(f"  • Recall:    {model_metrics['recall']:.2%}")
+    print(f"  • F1-Score:  {model_metrics['f1_score']:.2%}")
+
+# Compare with single model (Isolation Forest only)
+print("\n" + "="*70)
+print("📊 ENSEMBLE vs SINGLE MODEL COMPARISON")
+print("="*70)
+
+from sklearn.ensemble import IsolationForest
+
+# Train single IF model for comparison
+print("\nTraining single Isolation Forest for comparison...")
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+single_model = IsolationForest(contamination=0.03, random_state=42, n_estimators=100, n_jobs=1)
+single_model.fit(X_scaled)
+single_preds = (single_model.predict(X_scaled) == -1).astype(int)
+
+single_precision = precision_score(true_labels, single_preds, zero_division=0)
+single_recall = recall_score(true_labels, single_preds, zero_division=0)
+single_f1 = f1_score(true_labels, single_preds, zero_division=0)
+
+print("\nSINGLE MODEL (Isolation Forest):")
+print(f"  • Precision: {single_precision:.2%}")
+print(f"  • Recall:    {single_recall:.2%}")
+print(f"  • F1-Score:  {single_f1:.2%}")
+
+print("\nENSEMBLE (All Models):")
+print(f"  • Precision: {metrics['ensemble']['precision']:.2%}")
+print(f"  • Recall:    {metrics['ensemble']['recall']:.2%}")
+print(f"  • F1-Score:  {metrics['ensemble']['f1_score']:.2%}")
+
+improvement = (metrics['ensemble']['f1_score'] - single_f1) / single_f1 * 100
+print(f"\n🚀 Ensemble Improvement: {improvement:+.1f}%")
+
+print("\n📁 Output Files Created:")
 print("  • banking_logs_raw.csv")
 print("  • banking_logs_clean.csv")
-print("  • banking_logs_with_scores.csv")
-print()
+print("  • banking_logs_ensemble_results.csv")
+print("  • ensemble_model.pkl")
 
-print("🔝 Top 5 Anomalous Sessions:")
+print("\n🔝 Top 10 Anomalous Sessions (by Ensemble):")
 print("-"*70)
-top_5 = df.nlargest(5, 'anomaly_score')[[
+top_10 = df.nlargest(10, 'ensemble_score')[[
     'user_id_original', 'files_accessed', 'failed_logins',
-    'data_outbound_mb', 'file_encryption_rate', 'anomaly_score', 'is_anomaly'
+    'data_outbound_mb', 'file_encryption_rate', 'cpu_usage',
+    'ensemble_score', 'ensemble_prediction', 'true_label'
 ]]
-print(top_5.to_string(index=False))
-print()
+print(top_10.to_string(index=False))
 
-print("="*70)
-print("✅ PIPELINE COMPLETE!")
+print("\n" + "="*70)
+print("✅ ENSEMBLE PIPELINE COMPLETE!")
 print("="*70)
 print("\nNext Steps:")
-print("  1. Review: banking_logs_with_scores.csv")
-print("  2. Run Dashboard: streamlit run app.py")
+print("  1. Review: banking_logs_ensemble_results.csv")
+print("  2. Run Enhanced Dashboard: streamlit run app.py")
+print("  3. Compare model predictions in the results file")
 print(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("="*70)

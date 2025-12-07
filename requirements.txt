@@ -3,12 +3,8 @@ numpy>=1.21.0
 pandas>=1.3.0
 scikit-learn>=1.0.0
 
-# Machine Learning
+# Machine Learning & Model Persistence
 joblib>=1.0.0
-
-# Deep Learning (Optional - for Autoencoder)
-tensorflow>=2.8.0
-keras>=2.8.0
 
 # Visualization
 matplotlib>=3.4.0
@@ -21,5 +17,9 @@ streamlit>=1.20.0
 # Utilities
 python-dateutil>=2.8.0
 
-# For generating fake data
+# Optional: For generating more realistic fake data
 Faker>=8.0.0
+
+# Optional: Deep Learning (if you want to add Autoencoder to ensemble)
+# tensorflow>=2.8.0
+# keras>=2.8.0
